@@ -1,8 +1,8 @@
 
-use u_uno_syntax::ast::{BinOp, Block, Expr, FnDef, Param, Program, Stmt, Type, UnOp};
-use u_uno_syntax::error::ParseError;
-use u_uno_syntax::span::Span;
-use u_uno_syntax::token::{Token, TokenKind};
+use uno_syntax::ast::{BinOp, Block, Expr, FnDef, Param, Program, Stmt, Type, UnOp};
+use uno_syntax::error::ParseError;
+use uno_syntax::span::Span;
+use uno_syntax::token::{Token, TokenKind};
 
 pub struct Parser {
     tokens: Vec<Token>,
