@@ -275,6 +275,7 @@ dependencies = [
  "uno-codegen",
  "uno-lexer",
  "uno-parser",
+ "uno-syntax",
 ]
 
 [[package]]
