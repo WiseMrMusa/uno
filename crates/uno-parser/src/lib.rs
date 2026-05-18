@@ -132,6 +132,7 @@ impl Parser {
         match self.kind() {
             TokenKind::Let => self.parse_let_stmt(),
             TokenKind::Return => self.parse_return_stmt(),
+            TokenKind::If => self.parse_if_stmt(),
             _ => self.parse_expr_stmt(),
         }
     }
@@ -140,16 +141,19 @@ impl Parser {
         let start = self.token().span;
         self.expect(&TokenKind::Let)?;
         let name = self.expect_ident()?;
-        if self.check(&TokenKind::Colon) {
+        let type_ = if self.check(&TokenKind::Colon) {
             self.advance();
-            self.parse_type()?;
-        }
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::Equals)?;
         let value = self.parse_expr()?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt::Let(
             name,
             false,
+            type_,
             value,
             Span::merge(start, self.tokens[self.pos.saturating_sub(1)].span),
         ))
@@ -166,6 +170,33 @@ impl Parser {
             let semi = self.expect(&TokenKind::Semicolon)?;
             Ok(Stmt::Return(Some(value), Span::merge(start, semi.span)))
         }
+    }
+
+    fn parse_if_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.token().span;
+        self.expect(&TokenKind::If)?;
+        let cond = self.parse_expr()?;
+        let then_block = self.parse_block()?;
+        let else_block = if self.check(&TokenKind::Else) {
+            self.advance();
+            if self.check(&TokenKind::If) {
+                let else_if = self.parse_if_stmt()?;
+                let block = Block {
+                    stmts: vec![else_if],
+                    span: Span::empty(),
+                };
+                Some(block)
+            } else {
+                Some(self.parse_block()?)
+            }
+        } else {
+            None
+        };
+        let end = match &else_block {
+            Some(b) => b.span,
+            None => then_block.span,
+        };
+        Ok(Stmt::If(cond, then_block, else_block, Span::merge(start, end)))
     }
 
     fn parse_expr_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -247,6 +278,7 @@ impl Parser {
             let op = match self.kind() {
                 TokenKind::Star => BinOp::Mul,
                 TokenKind::Slash => BinOp::Div,
+                TokenKind::Percent => BinOp::Mod,
                 _ => break,
             };
             self.advance();

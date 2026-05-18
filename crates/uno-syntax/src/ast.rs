@@ -48,9 +48,10 @@ pub enum Expr {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    Let(String, bool, Expr, Span),
+    Let(String, bool, Option<Type>, Expr, Span),
     Return(Option<Expr>, Span),
     Expr(Expr, Span),
+    If(Expr, Block, Option<Block>, Span),
 }
 
 #[derive(Debug, Clone)]

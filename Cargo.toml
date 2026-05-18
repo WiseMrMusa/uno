@@ -1,6 +1,15 @@
+[workspace]
+members = ["crates/*"]
+
 [package]
 name = "uno"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+uno-lexer = { path = "crates/uno-lexer" }
+uno-parser = { path = "crates/uno-parser" }
+uno-codegen = { path = "crates/uno-codegen" }
