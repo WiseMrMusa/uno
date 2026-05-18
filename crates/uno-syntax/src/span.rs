@@ -1,33 +1,25 @@
 use std::fmt;
 
-#[derive(SpanTraits)]
+#[derive(Debug, Clone, Copy)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
 }
 
-trait SpanTraits {
-    fn new(start: usize, end: usize) -> Self;
-    fn empty() -> Self;]
-    fn len(&self) -> Self;
-    fn is_empty(&self) -> bool;
-    fn merge(a: Span, b: Span) -> Self;
-}
-
-impl SpanTraits for Span {
+impl Span {
     pub fn new(start: usize, end: usize) -> Self {
         Self { start, end }
     }
 
     pub fn empty() -> Self {
-        Self { start: 0, end: 0}
+        Self { start: 0, end: 0 }
     }
 
-    pub fn len(&self) -> Self {
+    pub fn len(&self) -> usize {
         self.end.saturating_sub(self.start)
     }
 
-    pub fn is_empty() -> bool {
+    pub fn is_empty(&self) -> bool {
         self.start == self.end
     }
 

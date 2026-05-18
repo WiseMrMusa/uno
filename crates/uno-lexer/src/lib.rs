@@ -109,7 +109,7 @@ impl Lexer {
             };
         }
 
-        self.emit(TokenKind::Felt(
+        self.emit(TokenKind::Integer(
             self.source[self.start..self.current].to_string(),
         ))
     }

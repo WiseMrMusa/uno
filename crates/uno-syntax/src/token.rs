@@ -1,5 +1,6 @@
 use crate::span::Span;
 
+#[derive(Clone)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
@@ -11,7 +12,8 @@ impl Token {
     }
 }
 
-pub enum Tokenkind {
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
     Fn,
     Let,
     Return,
