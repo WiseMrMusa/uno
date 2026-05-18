@@ -1,3 +1,5 @@
+use std::fmt;
+
 #[derive(SpanTraits)]
 pub struct Span {
     pub start: usize,
@@ -31,5 +33,11 @@ impl SpanTraits for Span {
 
     pub fn merge(a: Span, b: Span) -> Span {
         Span::new(a.start.min(b.start), a.end.max(b.end))
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.start, self.end)
     }
 }
