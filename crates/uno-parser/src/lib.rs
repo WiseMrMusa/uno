@@ -68,12 +68,20 @@ impl Parser {
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut functions = Vec::new();
         while !self.check(&TokenKind::Eof) {
+            if let TokenKind::Error(msg) = self.kind() {
+                let t = self.advance();
+                return Err(ParseError::new(format!("lex error: {msg}"), t.span));
+            }
             functions.push(self.parse_fn_def()?);
         }
         Ok(Program { functions })
     }
 
     fn parse_fn_def(&mut self) -> Result<FnDef, ParseError> {
+        if let TokenKind::Error(msg) = self.kind() {
+            let t = self.advance();
+            return Err(ParseError::new(format!("lex error: {msg}"), t.span));
+        }
         let start_span = self.token().span;
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
@@ -129,6 +137,10 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        if let TokenKind::Error(msg) = self.kind() {
+            let t = self.advance();
+            return Err(ParseError::new(format!("lex error: {msg}"), t.span));
+        }
         match self.kind() {
             TokenKind::Let => self.parse_let_stmt(),
             TokenKind::Return => self.parse_return_stmt(),
@@ -181,9 +193,10 @@ impl Parser {
             self.advance();
             if self.check(&TokenKind::If) {
                 let else_if = self.parse_if_stmt()?;
+                let block_span = expr_span_for_stmt(&else_if);
                 let block = Block {
                     stmts: vec![else_if],
-                    span: Span::empty(),
+                    span: block_span,
                 };
                 Some(block)
             } else {
@@ -343,6 +356,10 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         let token = self.token();
+        if let TokenKind::Error(msg) = &token.kind {
+            let t = self.advance();
+            return Err(ParseError::new(format!("lex error: {msg}"), t.span));
+        }
         match token.kind {
             TokenKind::Integer(val) => {
                 self.advance();
@@ -397,6 +414,131 @@ impl Parser {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(source: &str) -> Result<Program, ParseError> {
+        let mut lexer = uno_lexer::Lexer::new(source.to_string());
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        parser.parse_program()
+    }
+
+    #[test]
+    fn empty_program() {
+        let prog = parse("").unwrap();
+        assert!(prog.functions.is_empty());
+    }
+
+    #[test]
+    fn simple_function() {
+        let prog = parse("fn main() -> u32 { return 0; }").unwrap();
+        assert_eq!(prog.functions.len(), 1);
+        let f = &prog.functions[0];
+        assert_eq!(f.name, "main");
+        assert!(f.params.is_empty());
+        assert_eq!(f.return_type, Type::Uint(32));
+    }
+
+    #[test]
+    fn function_with_params() {
+        let prog = parse("fn add(a: u32, b: u32) -> u32 { return a + b; }").unwrap();
+        assert_eq!(prog.functions.len(), 1);
+        let f = &prog.functions[0];
+        assert_eq!(f.params.len(), 2);
+        assert_eq!(f.params[0].name, "a");
+        assert_eq!(f.params[1].name, "b");
+    }
+
+    #[test]
+    fn let_statement() {
+        let prog = parse("fn main() -> u32 { let x: u32 = 42; return x; }").unwrap();
+        let body = &prog.functions[0].body;
+        match &body.stmts[0] {
+            Stmt::Let(name, is_mut, type_, value, _) => {
+                assert_eq!(name, "x");
+                assert!(!is_mut);
+                assert_eq!(type_.as_ref(), Some(&Type::Uint(32)));
+                assert!(matches!(value, Expr::Literal(v, _) if v == "42"));
+            }
+            _ => panic!("expected let stmt"),
+        }
+    }
+
+    #[test]
+    fn if_else() {
+        let prog = parse("fn main() -> u32 { if true { return 1; } else { return 2; } }").unwrap();
+        let body = &prog.functions[0].body;
+        match &body.stmts[0] {
+            Stmt::If(_, then_block, Some(else_block), _) => {
+                assert_eq!(then_block.stmts.len(), 1);
+                assert_eq!(else_block.stmts.len(), 1);
+            }
+            _ => panic!("expected if stmt"),
+        }
+    }
+
+    #[test]
+    fn else_if_chain() {
+        let src = "fn main() -> u32 { if false { 1 } else if true { 2 } else { 3 } }";
+        let prog = parse(src).unwrap();
+        let body = &prog.functions[0].body;
+        match &body.stmts[0] {
+            Stmt::If(_, then_block, Some(else_block), _) => {
+                assert_eq!(then_block.stmts.len(), 1);
+                assert!(matches!(&else_block.stmts[0], Stmt::If(..)));
+            }
+            _ => panic!("expected if stmt"),
+        }
+    }
+
+    #[test]
+    fn binary_ops() {
+        let prog = parse("fn main() -> u32 { return 1 + 2 * 3; }").unwrap();
+        let body = &prog.functions[0].body;
+        match &body.stmts[0] {
+            Stmt::Return(Some(Expr::BinaryOp(_, _, _, _)), _) => {}
+            _ => panic!("expected binary op"),
+        }
+    }
+
+    #[test]
+    fn fn_call() {
+        let prog = parse("fn main() -> u32 { return foo(1, 2); }").unwrap();
+        let body = &prog.functions[0].body;
+        match &body.stmts[0] {
+            Stmt::Return(Some(Expr::FnCall(name, args, _)), _) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("expected fn call"),
+        }
+    }
+
+    #[test]
+    fn lex_error_propagated() {
+        let result = parse("fn main() -> u32 { let x = @; }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_error_expected_type() {
+        let result = parse("fn main() -> foo { }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn block_expr() {
+        let prog = parse("fn main() -> u32 { let x = { 42 }; return x; }").unwrap();
+        let body = &prog.functions[0].body;
+        match &body.stmts[0] {
+            Stmt::Let(_, _, _, Expr::Block(_, _), _) => {}
+            _ => panic!("expected block expr"),
+        }
+    }
+}
+
 fn expr_span(expr: &Expr) -> Span {
     match expr {
         Expr::Literal(_, s)
@@ -406,5 +548,14 @@ fn expr_span(expr: &Expr) -> Span {
         | Expr::Block(_, s)
         | Expr::FnCall(_, _, s)
         | Expr::Paren(_, s) => *s,
+    }
+}
+
+fn expr_span_for_stmt(stmt: &Stmt) -> Span {
+    match stmt {
+        Stmt::Let(_, _, _, _, s)
+        | Stmt::Return(_, s)
+        | Stmt::Expr(_, s)
+        | Stmt::If(_, _, _, s) => *s,
     }
 }

@@ -282,6 +282,8 @@ dependencies = [
 name = "uno-codegen"
 version = "0.1.0"
 dependencies = [
+ "uno-lexer",
+ "uno-parser",
  "uno-syntax",
 ]
 
@@ -296,6 +298,7 @@ dependencies = [
 name = "uno-parser"
 version = "0.1.0"
 dependencies = [
+ "uno-lexer",
  "uno-syntax",
 ]
 

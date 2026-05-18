@@ -3,5 +3,11 @@ name = "uno-parser"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unused_crate_dependencies = "warn"
+
 [dependencies]
 uno-syntax = { path = '../uno-syntax' }
+
+[dev-dependencies]
+uno-lexer = { path = '../uno-lexer' }

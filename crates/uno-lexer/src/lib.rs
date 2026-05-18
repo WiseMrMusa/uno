@@ -287,3 +287,130 @@ impl Lexer {
         tokens
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokenize(source: &str) -> Vec<TokenKind> {
+        let mut lexer = Lexer::new(source.to_string());
+        lexer.tokenize().into_iter().map(|t| t.kind).collect()
+    }
+
+    #[test]
+    fn integer_literal() {
+        let kinds = tokenize("42");
+        assert_eq!(kinds, vec![TokenKind::Integer("42".into()), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn hex_literal() {
+        let kinds = tokenize("0xFF");
+        assert!(matches!(kinds[0], TokenKind::Integer(ref s) if s == "0xFF"));
+    }
+
+    #[test]
+    fn typed_literal() {
+        let kinds = tokenize("42_u64");
+        assert!(matches!(kinds[0], TokenKind::Integer(ref s) if s == "42"));
+    }
+
+    #[test]
+    fn keywords() {
+        let kinds = tokenize("fn let return if else true false mut");
+        assert_eq!(kinds[0], TokenKind::Fn);
+        assert_eq!(kinds[1], TokenKind::Let);
+        assert_eq!(kinds[2], TokenKind::Return);
+        assert_eq!(kinds[3], TokenKind::If);
+        assert_eq!(kinds[4], TokenKind::Else);
+        assert_eq!(kinds[5], TokenKind::True);
+        assert_eq!(kinds[6], TokenKind::False);
+        assert_eq!(kinds[7], TokenKind::Mut);
+    }
+
+    #[test]
+    fn types() {
+        let kinds = tokenize("bool u8 u32 u64");
+        assert_eq!(kinds[0], TokenKind::BoolType);
+        assert_eq!(kinds[1], TokenKind::Uint(8));
+        assert_eq!(kinds[2], TokenKind::Uint(32));
+        assert_eq!(kinds[3], TokenKind::Uint(64));
+    }
+
+    #[test]
+    fn operators() {
+        let kinds = tokenize("+ - * / % == != < > <= >= && || !");
+        assert_eq!(kinds[0], TokenKind::Plus);
+        assert_eq!(kinds[1], TokenKind::Minus);
+        assert_eq!(kinds[2], TokenKind::Star);
+        assert_eq!(kinds[3], TokenKind::Slash);
+        assert_eq!(kinds[4], TokenKind::Percent);
+        assert_eq!(kinds[5], TokenKind::EqualsEquals);
+        assert_eq!(kinds[6], TokenKind::NotEquals);
+        assert_eq!(kinds[7], TokenKind::Less);
+        assert_eq!(kinds[8], TokenKind::Greater);
+        assert_eq!(kinds[9], TokenKind::LessEquals);
+        assert_eq!(kinds[10], TokenKind::GreaterEquals);
+        assert_eq!(kinds[11], TokenKind::AndAnd);
+        assert_eq!(kinds[12], TokenKind::OrOr);
+        assert_eq!(kinds[13], TokenKind::Not);
+    }
+
+    #[test]
+    fn punctuation() {
+        let kinds = tokenize("( ) { } [ ] , ; : ->");
+        assert_eq!(kinds[0], TokenKind::LParen);
+        assert_eq!(kinds[1], TokenKind::RParen);
+        assert_eq!(kinds[2], TokenKind::LBrace);
+        assert_eq!(kinds[3], TokenKind::RBrace);
+        assert_eq!(kinds[4], TokenKind::LBracket);
+        assert_eq!(kinds[5], TokenKind::RBracket);
+        assert_eq!(kinds[6], TokenKind::Comma);
+        assert_eq!(kinds[7], TokenKind::Semicolon);
+        assert_eq!(kinds[8], TokenKind::Colon);
+        assert_eq!(kinds[9], TokenKind::Arrow);
+    }
+
+    #[test]
+    fn line_comment() {
+        let kinds = tokenize("// comment\n42");
+        assert_eq!(kinds, vec![TokenKind::Integer("42".into()), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn block_comment() {
+        let kinds = tokenize("/* comment */ 42");
+        assert_eq!(kinds, vec![TokenKind::Integer("42".into()), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn error_on_bad_suffix() {
+        let kinds = tokenize("42_xyz");
+        assert!(matches!(kinds[0], TokenKind::Error(_)));
+    }
+
+    #[test]
+    fn error_on_unexpected_char() {
+        let kinds = tokenize("@");
+        assert!(matches!(kinds[0], TokenKind::Error(_)));
+    }
+
+    #[test]
+    fn error_on_single_ampersand() {
+        let kinds = tokenize("&");
+        assert!(matches!(kinds[0], TokenKind::Error(_)));
+    }
+
+    #[test]
+    fn eof_only() {
+        let kinds = tokenize("");
+        assert_eq!(kinds, vec![TokenKind::Eof]);
+    }
+
+    #[test]
+    fn identifier() {
+        let kinds = tokenize("hello world");
+        assert_eq!(kinds[0], TokenKind::Ident("hello".into()));
+        assert_eq!(kinds[1], TokenKind::Ident("world".into()));
+    }
+}

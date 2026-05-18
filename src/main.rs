@@ -4,13 +4,20 @@ use std::path::PathBuf;
 use std::process::Command;
 use uno_codegen::c::Codegen;
 use uno_codegen::wasm::WasmCodegen;
+use uno_codegen::CodegenError;
 use uno_syntax::ast::Program;
+use uno_syntax::backend::Backend;
+use uno_syntax::source_file::SourceFile;
 
 #[derive(Parser)]
 #[command(name = "uno", version = "0.1.0")]
 struct Cli {
     #[command(subcommand)]
     cmd: Subcmd,
+
+    /// Verbose output
+    #[arg(short = 'v', long, global = true, default_value_t = false)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -22,16 +29,30 @@ enum Subcmd {
         /// Target backend (c, wasm)
         #[arg(long, default_value = "c")]
         target: Target,
+        /// Output directory
+        #[arg(long, default_value = "target")]
+        out_dir: String,
     },
     /// Build and run the current project
     Run {
         /// Target backend (c, wasm)
         #[arg(long, default_value = "c")]
         target: Target,
+        /// Output directory
+        #[arg(long, default_value = "target")]
+        out_dir: String,
     },
+    /// Parse and check the current project without codegen
+    Check {
+        /// Output directory (reserved)
+        #[arg(long, default_value = "target")]
+        out_dir: String,
+    },
+    /// Remove the target directory
+    Clean,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Debug, ValueEnum)]
 enum Target {
     C,
     Wasm,
@@ -49,21 +70,32 @@ struct Package {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.cmd {
+    let res = match cli.cmd {
         Subcmd::New { name } => cmd_new(&name),
-        Subcmd::Build { target } => cmd_build(false, &target),
-        Subcmd::Run { target } => cmd_build(true, &target),
+        Subcmd::Build {
+            target,
+            ref out_dir,
+        } => cmd_build(false, &target, out_dir, cli.verbose),
+        Subcmd::Run {
+            target,
+            ref out_dir,
+        } => cmd_build(true, &target, out_dir, cli.verbose),
+        Subcmd::Check { ref out_dir } => cmd_check(out_dir, cli.verbose),
+        Subcmd::Clean => cmd_clean(cli.verbose),
+    };
+    if let Err(e) = res {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
 }
 
-fn cmd_new(name: &str) {
+fn cmd_new(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(name);
     if dir.exists() {
-        eprintln!("error: directory '{name}' already exists");
-        std::process::exit(1);
+        return Err(format!("directory '{name}' already exists").into());
     }
 
-    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::create_dir_all(dir.join("src"))?;
 
     let manifest = format!(
         r#"[package]
@@ -72,139 +104,185 @@ version = "0.1.0"
 edition = "2024"
 "#
     );
-    fs::write(dir.join("uno.toml"), manifest).expect("failed to write uno.toml");
+    fs::write(dir.join("uno.toml"), manifest)?;
 
     let main_source = "fn main() -> u32 {\n    return 0;\n}\n";
-    fs::write(dir.join("src").join("main.uno"), main_source)
-        .expect("failed to write src/main.uno");
+    fs::write(dir.join("src").join("main.uno"), main_source)?;
 
     println!("Created project '{name}'");
+    Ok(())
 }
 
-fn read_project() -> (String, uno_parser::Parser) {
-    let manifest_str = fs::read_to_string("uno.toml").unwrap_or_else(|_| {
-        eprintln!("error: uno.toml not found (are you in an Uno project?)");
-        std::process::exit(1);
-    });
-    let manifest: Manifest = toml::from_str(&manifest_str).unwrap_or_else(|e| {
-        eprintln!("error: failed to parse uno.toml: {e}");
-        std::process::exit(1);
-    });
-
+fn read_project() -> Result<(String, SourceFile, uno_parser::Parser), Box<dyn std::error::Error>> {
+    let manifest_str = fs::read_to_string("uno.toml")
+        .map_err(|_| "uno.toml not found (are you in an Uno project?)")?;
+    let manifest: Manifest = toml::from_str(&manifest_str)?;
     let project_name = manifest.package.name;
 
-    let source = fs::read_to_string("src/main.uno").unwrap_or_else(|_| {
-        eprintln!("error: src/main.uno not found");
-        std::process::exit(1);
-    });
+    let source_str = fs::read_to_string("src/main.uno")
+        .map_err(|_| "src/main.uno not found")?;
+    let source = SourceFile::new(source_str.clone());
 
-    let mut lexer = uno_lexer::Lexer::new(source);
+    let mut lexer = uno_lexer::Lexer::new(source_str);
     let tokens = lexer.tokenize();
 
     let parser = uno_parser::Parser::new(tokens);
-    (project_name, parser)
+    Ok((project_name, source, parser))
 }
 
-fn cmd_build(run_after: bool, target: &Target) {
-    let (project_name, mut parser) = read_project();
+fn parse_program(
+    source: &SourceFile,
+    parser: &mut uno_parser::Parser,
+) -> Result<Program, Box<dyn std::error::Error>> {
+    parser.parse_program().map_err(|e| {
+        let formatted = source.format_error(e.span, &e.message);
+        format!("{formatted}").into()
+    })
+}
 
-    let program = parser.parse_program().unwrap_or_else(|err| {
-        eprintln!("error: {err}");
-        std::process::exit(1);
-    });
+fn get_backend(target: &Target) -> Box<dyn Backend<Output = String, Err = CodegenError>> {
+    match target {
+        Target::C => Box::new(Codegen::new()),
+        Target::Wasm => Box::new(WasmCodegen::new()),
+    }
+}
 
-    let target_dir = PathBuf::from("target");
-    fs::create_dir_all(&target_dir).expect("failed to create target/ directory");
+fn cmd_build(
+    run_after: bool,
+    target: &Target,
+    out_dir: &str,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (project_name, source, mut parser) = read_project()?;
+
+    if verbose {
+        eprintln!("parsing {}...", "src/main.uno");
+    }
+    let program = parse_program(&source, &mut parser)?;
+
+    let target_dir = PathBuf::from(out_dir);
+    fs::create_dir_all(&target_dir)?;
+
+    if verbose {
+        eprintln!("generating code for target {target:?}...");
+    }
+
+    let mut backend = get_backend(target);
+    let code = backend.generate(&program)?;
+    let backend_name = backend.name();
 
     match target {
-        Target::C => build_c(&project_name, &target_dir, &program, run_after),
-        Target::Wasm => build_wasm(&project_name, &target_dir, &program, run_after),
-    }
-}
+        Target::C => {
+            let c_path = target_dir.join("output.c");
+            fs::write(&c_path, &code)?;
 
-fn build_c(project_name: &str, target_dir: &PathBuf, program: &Program, run_after: bool) {
-    let c_code = Codegen::generate(program);
+            if verbose {
+                eprintln!("compiling with cc...");
+            }
+            let binary_name = if cfg!(target_os = "windows") {
+                format!("{project_name}.exe")
+            } else {
+                project_name.clone()
+            };
+            let binary_path = target_dir.join(&binary_name);
 
-    let c_path = target_dir.join("output.c");
-    fs::write(&c_path, c_code).expect("failed to write output.c");
+            let status = Command::new("cc")
+                .arg("-std=c23")
+                .arg("-o")
+                .arg(&binary_path)
+                .arg(&c_path)
+                .status()
+                .map_err(|_| "failed to run 'cc' (is a C compiler installed?)")?;
 
-    let binary_name = if cfg!(target_os = "windows") {
-        format!("{project_name}.exe")
-    } else {
-        project_name.to_string()
-    };
-    let binary_path = target_dir.join(&binary_name);
+            if !status.success() {
+                return Err("C compilation failed".into());
+            }
 
-    let status = Command::new("cc")
-        .arg("-std=c23")
-        .arg("-o")
-        .arg(&binary_path)
-        .arg(&c_path)
-        .status()
-        .unwrap_or_else(|_| {
-            eprintln!("error: failed to run 'cc' (is a C compiler installed?)");
-            std::process::exit(1);
-        });
+            println!("Compiled '{project_name}' ({backend_name})");
 
-    if !status.success() {
-        eprintln!("error: C compilation failed");
-        std::process::exit(1);
-    }
+            if run_after {
+                if verbose {
+                    eprintln!("running {}...", binary_path.display());
+                }
+                let status = Command::new(&binary_path)
+                    .status()
+                    .map_err(|_| "failed to run binary")?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        Target::Wasm => {
+            let wat_path = target_dir.join("output.wat");
+            fs::write(&wat_path, &code)?;
 
-    println!("Compiled '{project_name}'");
+            if verbose {
+                eprintln!("compiling with wat2wasm...");
+            }
+            let wasm_path = target_dir.join(format!("{project_name}.wasm"));
 
-    if run_after {
-        let status = Command::new(&binary_path).status().unwrap_or_else(|_| {
-            eprintln!("error: failed to run binary");
-            std::process::exit(1);
-        });
-        std::process::exit(status.code().unwrap_or(1));
-    }
-}
-
-fn build_wasm(project_name: &str, target_dir: &PathBuf, program: &Program, run_after: bool) {
-    let wat = WasmCodegen::generate(program);
-
-    let wat_path = target_dir.join("output.wat");
-    fs::write(&wat_path, wat).expect("failed to write output.wat");
-
-    let wasm_path = target_dir.join(format!("{project_name}.wasm"));
-
-    let wat2wasm = Command::new("npx")
-        .args(["--yes", "wat2wasm"])
-        .arg(&wat_path)
-        .arg("-o")
-        .arg(&wasm_path)
-        .status()
-        .or_else(|_| {
-            Command::new("wat2wasm")
+            let wat2wasm = Command::new("npx")
+                .args(["--yes", "wat2wasm"])
                 .arg(&wat_path)
                 .arg("-o")
                 .arg(&wasm_path)
                 .status()
-        });
+                .or_else(|_| {
+                    Command::new("wat2wasm")
+                        .arg(&wat_path)
+                        .arg("-o")
+                        .arg(&wasm_path)
+                        .status()
+                });
 
-    match wat2wasm {
-        Ok(status) if status.success() => {
-            println!("Compiled '{project_name}' to WASM");
+            match wat2wasm {
+                Ok(status) if status.success() => {
+                    println!("Compiled '{project_name}' to WASM ({backend_name})");
 
-            if run_after {
-                let runtime = which_runtime();
-                match runtime {
-                    Some("wasmtime") => {
-                        let status = Command::new("wasmtime")
-                            .arg(&wasm_path)
-                            .status()
-                            .unwrap_or_else(|_| {
-                                eprintln!("error: failed to run wasmtime");
-                                std::process::exit(1);
-                            });
-                        std::process::exit(status.code().unwrap_or(1));
+                    if run_after {
+                        run_wasm(&target_dir, &wasm_path, verbose)?;
                     }
-                    Some("node") => {
-                        let runner = target_dir.join("run.mjs");
-                        let js = format!(
-                            r#"import {{ readFile }} from "node:fs/promises";
+                }
+                Ok(_) => {
+                    return Err(
+                        "WASM compilation failed (install wabt/wat2wasm)".into(),
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "wrote {} — install wabt (wat2wasm) or use npx to compile",
+                        wat_path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_wasm(
+    target_dir: &PathBuf,
+    wasm_path: &PathBuf,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = which_runtime();
+    match runtime {
+        Some("wasmtime") => {
+            if verbose {
+                eprintln!("running wasmtime {}...", wasm_path.display());
+            }
+            let status = Command::new("wasmtime")
+                .arg(wasm_path)
+                .status()
+                .map_err(|_| "failed to run wasmtime")?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Some("node") => {
+            if verbose {
+                eprintln!("running node with WebAssembly...");
+            }
+            let runner = target_dir.join("run.mjs");
+            let js = format!(
+                r#"import {{ readFile }} from "node:fs/promises";
 const wasm = await readFile("{}");
 const mod = await WebAssembly.compile(wasm);
 const instance = await WebAssembly.instantiate(mod);
@@ -215,33 +293,45 @@ if (typeof result === "bigint") {{
   console.log("exit:", result);
 }}
 "#,
-                            wasm_path.display()
-                        );
-                        fs::write(&runner, js).expect("failed to write runner script");
-                        let status = Command::new("node")
-                            .arg(&runner)
-                            .status()
-                            .unwrap_or_else(|_| {
-                                eprintln!("error: failed to run node");
-                                std::process::exit(1);
-                            });
-                        std::process::exit(status.code().unwrap_or(1));
-                    }
-                    _ => {
-                        eprintln!("note: install wasmtime or node to run WASM");
-                    }
-                }
-            }
+                wasm_path.display()
+            );
+            fs::write(&runner, js)?;
+            let status = Command::new("node")
+                .arg(&runner)
+                .status()
+                .map_err(|_| "failed to run node")?;
+            std::process::exit(status.code().unwrap_or(1));
         }
-        Ok(_) => {
-            eprintln!("error: WASM compilation failed");
-            eprintln!("note: install wabt (wat2wasm) to compile .wat files");
-            std::process::exit(1);
-        }
-        Err(_) => {
-            eprintln!("wrote {} — install wabt (wat2wasm) or use npx to compile", wat_path.display());
+        _ => {
+            eprintln!("note: install wasmtime or node to run WASM");
+            Ok(())
         }
     }
+}
+
+fn cmd_check(out_dir: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (_project_name, source, mut parser) = read_project()?;
+    if verbose {
+        eprintln!("parsing {}...", "src/main.uno");
+    }
+    let _program = parse_program(&source, &mut parser)?;
+    println!("check: no errors found");
+    let _ = out_dir;
+    Ok(())
+}
+
+fn cmd_clean(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let target = PathBuf::from("target");
+    if target.exists() {
+        if verbose {
+            eprintln!("removing {}...", target.display());
+        }
+        fs::remove_dir_all(&target)?;
+        println!("removed {}", target.display());
+    } else {
+        println!("nothing to clean");
+    }
+    Ok(())
 }
 
 fn which_runtime() -> Option<&'static str> {
