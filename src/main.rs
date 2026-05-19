@@ -1,3 +1,5 @@
+mod interpreter;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -33,8 +35,8 @@ enum Subcmd {
         out_dir: String,
     },
     Run {
-        #[arg(long, default_value = "c")]
-        target: Target,
+        #[arg(long)]
+        target: Option<Target>,
         #[arg(long, default_value = "target")]
         out_dir: String,
     },
@@ -72,7 +74,12 @@ fn main() {
     let res = match cli.cmd {
         Subcmd::New { name } => cmd_new(&name),
         Subcmd::Build { target, ref out_dir } => cmd_build(false, &target, out_dir, cli.verbose),
-        Subcmd::Run { target, ref out_dir } => cmd_build(true, &target, out_dir, cli.verbose),
+        Subcmd::Run { target, ref out_dir } => {
+            match target {
+                Some(t) => cmd_build(true, &t, out_dir, cli.verbose),
+                None => cmd_run_interpreter(cli.verbose),
+            }
+        }
         Subcmd::Check { ref out_dir } => cmd_check(out_dir, cli.verbose),
         Subcmd::Clean => cmd_clean(cli.verbose),
     };
@@ -404,6 +411,18 @@ fn cmd_build(
     fs::write(&cache_path, cache_data)?;
 
     Ok(())
+}
+
+fn cmd_run_interpreter(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ctx = read_project(verbose)?;
+    let ir = parse_all(&mut ctx, verbose)?;
+
+    if verbose { eprintln!("running interpreter..."); }
+    let exit_code = interpreter::Interpreter::run(&ir, verbose)
+        .map_err(|e| format!("runtime error: {e}"))?;
+
+    if !verbose { println!("exit: {exit_code}"); }
+    std::process::exit(exit_code)
 }
 
 fn add_line_directives(code: &str, source_file: &str) -> String {
