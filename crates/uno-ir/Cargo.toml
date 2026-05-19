@@ -1,5 +1,5 @@
 [package]
-name = "uno-codegen"
+name = "uno-ir"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,7 +8,6 @@ unused_crate_dependencies = "warn"
 
 [dependencies]
 uno-syntax = { path = '../uno-syntax' }
-uno-ir = { path = '../uno-ir' }
 
 [dev-dependencies]
 uno-lexer = { path = '../uno-lexer' }

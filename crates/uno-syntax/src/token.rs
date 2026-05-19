@@ -25,6 +25,7 @@ pub enum TokenKind {
     Pub,
     While,
     Loop,
+    Break,
     For,
     In,
     Match,

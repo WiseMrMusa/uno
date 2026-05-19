@@ -273,6 +273,7 @@ dependencies = [
  "serde",
  "toml",
  "uno-codegen",
+ "uno-ir",
  "uno-lexer",
  "uno-parser",
  "uno-syntax",
@@ -280,6 +281,16 @@ dependencies = [
 
 [[package]]
 name = "uno-codegen"
+version = "0.1.0"
+dependencies = [
+ "uno-ir",
+ "uno-lexer",
+ "uno-parser",
+ "uno-syntax",
+]
+
+[[package]]
+name = "uno-ir"
 version = "0.1.0"
 dependencies = [
  "uno-lexer",

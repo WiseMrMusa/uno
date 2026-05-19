@@ -17,3 +17,4 @@ uno-lexer = { path = "crates/uno-lexer" }
 uno-parser = { path = "crates/uno-parser" }
 uno-syntax = { path = "crates/uno-syntax" }
 uno-codegen = { path = "crates/uno-codegen" }
+uno-ir = { path = "crates/uno-ir" }

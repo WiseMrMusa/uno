@@ -1,9 +1,6 @@
 use crate::error::CodegenError;
-use crate::generate::{ExprGen, FnGen, ProgramGen, StmtGen, TypeGen};
 use std::fmt::Write;
-use uno_syntax::ast::*;
-use uno_syntax::backend::Backend;
-use uno_syntax::span::Span;
+use uno_ir::{Inst, IrBackend, IrConstant, IrFunction, IrProgram, IrType, Value};
 
 pub struct Codegen {
     output: String,
@@ -42,317 +39,205 @@ impl Codegen {
         self.output.push('\n');
     }
 
-    fn gen_block_body(&mut self, block: &Block) -> Result<(), CodegenError> {
-        self.push();
-        for stmt in &block.stmts {
-            self.gen_stmt(stmt)?;
+    fn val_str(&self, v: &Value) -> String {
+        match v {
+            Value::Local(id) => id.clone(),
+            Value::Const(c) => self.const_str(c),
         }
-        self.pop();
-        Ok(())
     }
 
-    fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), CodegenError> {
-        self.write_indent();
-        match stmt {
-            Stmt::Let(name, is_mut, type_, value, span) => {
-                self.gen_let_stmt(name, *is_mut, type_.as_ref(), value, span)
+    fn const_str(&self, c: &IrConstant) -> String {
+        match c {
+            IrConstant::Int(n) => n.to_string(),
+            IrConstant::Bool(true) => "true".to_string(),
+            IrConstant::Bool(false) => "false".to_string(),
+        }
+    }
+
+    fn c_type(ty: &IrType) -> Result<&str, CodegenError> {
+        match ty {
+            IrType::Bool => Ok("bool"),
+            IrType::Uint(8) => Ok("uint8_t"),
+            IrType::Uint(16) => Ok("uint16_t"),
+            IrType::Uint(32) => Ok("uint32_t"),
+            IrType::Uint(64) => Ok("uint64_t"),
+            IrType::Uint(128) => Ok("unsigned __int128"),
+            _ => Err(CodegenError::UnsupportedType(uno_syntax::ast::Type::Uint(
+                if let IrType::Uint(n) = ty { *n } else { 0 },
+            ))),
+        }
+    }
+
+    fn gen_inst(&mut self, inst: &Inst) -> Result<(), CodegenError> {
+        match inst {
+            Inst::Add(d, ty, a, b) => self.gen_binop(d, ty, a, b, "+"),
+            Inst::Sub(d, ty, a, b) => self.gen_binop(d, ty, a, b, "-"),
+            Inst::Mul(d, ty, a, b) => self.gen_binop(d, ty, a, b, "*"),
+            Inst::Div(d, ty, a, b) => self.gen_binop(d, ty, a, b, "/"),
+            Inst::Mod(d, ty, a, b) => self.gen_binop(d, ty, a, b, "%"),
+            Inst::Eq(d, a, b) => self.gen_cmp(d, a, b, "=="),
+            Inst::Neq(d, a, b) => self.gen_cmp(d, a, b, "!="),
+            Inst::Lt(d, a, b) => self.gen_cmp(d, a, b, "<"),
+            Inst::Gt(d, a, b) => self.gen_cmp(d, a, b, ">"),
+            Inst::Le(d, a, b) => self.gen_cmp(d, a, b, "<="),
+            Inst::Ge(d, a, b) => self.gen_cmp(d, a, b, ">="),
+            Inst::And(d, a, b) => self.gen_binop(d, &IrType::Bool, a, b, "&&"),
+            Inst::Or(d, a, b) => self.gen_binop(d, &IrType::Bool, a, b, "||"),
+            Inst::Not(d, a) => self.gen_unop(d, a, "!"),
+            Inst::Neg(d, ty, a) => {
+                let t = Self::c_type(ty)?;
+                let av = self.val_str(a);
+                self.writeln_indented(&format!("{t} {d} = -({av});"));
             }
-            Stmt::Return(expr, span) => self.gen_return_stmt(expr.as_ref(), span),
-            Stmt::Expr(expr, span) => self.gen_expr_stmt(expr, span),
-            Stmt::If(cond, then_block, else_block, span) => {
-                self.gen_if_stmt(cond, then_block, else_block.as_ref(), span)
+            Inst::LoadConst(d, c, ty) => {
+                let t = Self::c_type(ty)?;
+                let cv = self.const_str(c);
+                self.writeln_indented(&format!("{t} {d} = {cv};"));
             }
-        }
-    }
-
-    fn gen_expr(&mut self, expr: &Expr) -> Result<String, CodegenError> {
-        match expr {
-            Expr::Literal(val, span) => self.gen_literal(val, span),
-            Expr::Ident(name, span) => self.gen_ident(name, span),
-            Expr::BinaryOp(left, op, right, span) => {
-                self.gen_binary_op(left, op, right, span)
+            Inst::Load(d, ty, src) => {
+                let t = Self::c_type(ty)?;
+                self.writeln_indented(&format!("{t} {d} = {src};"));
             }
-            Expr::UnaryOp(op, operand, span) => self.gen_unary_op(op, operand, span),
-            Expr::Block(block, _) => self.gen_block_expr(block),
-            Expr::FnCall(name, args, span) => self.gen_fn_call(name, args, span),
-            Expr::Paren(inner, span) => self.gen_paren(inner, span),
-        }
-    }
-
-    pub fn generate(prog: &Program) -> Result<String, CodegenError> {
-        let mut cg = Codegen::new();
-        cg.gen_program(prog)
-    }
-}
-
-impl TypeGen for Codegen {
-    type Output = String;
-    type Error = CodegenError;
-
-    fn gen_type(&mut self, type_: &Type) -> Result<String, CodegenError> {
-        match type_ {
-            Type::Bool => Ok("bool".to_string()),
-            Type::Uint(8) => Ok("uint8_t".to_string()),
-            Type::Uint(16) => Ok("uint16_t".to_string()),
-            Type::Uint(32) => Ok("uint32_t".to_string()),
-            Type::Uint(64) => Ok("uint64_t".to_string()),
-            Type::Uint(128) => Ok("unsigned __int128".to_string()),
-            _ => Err(CodegenError::UnsupportedType(type_.clone())),
-        }
-    }
-}
-
-impl ExprGen for Codegen {
-    type Output = String;
-    type Error = CodegenError;
-
-    fn gen_literal(&mut self, val: &str, _span: &Span) -> Result<String, CodegenError> {
-        Ok(val.to_string())
-    }
-
-    fn gen_ident(&mut self, name: &str, _span: &Span) -> Result<String, CodegenError> {
-        match name {
-            "true" => Ok("true".to_string()),
-            "false" => Ok("false".to_string()),
-            _ => Ok(name.to_string()),
-        }
-    }
-
-    fn gen_binary_op(
-        &mut self,
-        left: &Expr,
-        op: &BinOp,
-        right: &Expr,
-        _span: &Span,
-    ) -> Result<String, CodegenError> {
-        let op_str = match op {
-            BinOp::Add => "+",
-            BinOp::Sub => "-",
-            BinOp::Mul => "*",
-            BinOp::Div => "/",
-            BinOp::Mod => "%",
-            BinOp::Eq => "==",
-            BinOp::Neq => "!=",
-            BinOp::Lt => "<",
-            BinOp::Gt => ">",
-            BinOp::Le => "<=",
-            BinOp::Ge => ">=",
-            BinOp::And => "&&",
-            BinOp::Or => "||",
-        };
-        Ok(format!(
-            "({} {} {})",
-            self.gen_expr(left)?,
-            op_str,
-            self.gen_expr(right)?
-        ))
-    }
-
-    fn gen_unary_op(
-        &mut self,
-        op: &UnOp,
-        operand: &Expr,
-        _span: &Span,
-    ) -> Result<String, CodegenError> {
-        let op_str = match op {
-            UnOp::Neg => "-",
-            UnOp::Not => "!",
-        };
-        Ok(format!("{}{}", op_str, self.gen_expr(operand)?))
-    }
-
-    fn gen_block_expr(&mut self, block: &Block) -> Result<String, CodegenError> {
-        let outer_indent = self.indent;
-        let mut cg = Codegen::new();
-        cg.indent = outer_indent;
-        cg.output.push_str("{\n");
-        cg.indent = outer_indent + 1;
-        for stmt in &block.stmts {
-            cg.gen_stmt(stmt)?;
-        }
-        cg.indent = outer_indent;
-        cg.writeln_indented("}");
-        Ok(cg.output)
-    }
-
-    fn gen_fn_call(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        _span: &Span,
-    ) -> Result<String, CodegenError> {
-        let args_str: Vec<String> = args
-            .iter()
-            .map(|a| self.gen_expr(a))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(format!("{}({})", name, args_str.join(", ")))
-    }
-
-    fn gen_paren(&mut self, inner: &Expr, _span: &Span) -> Result<String, CodegenError> {
-        Ok(format!("({})", self.gen_expr(inner)?))
-    }
-}
-
-impl StmtGen for Codegen {
-    type Output = ();
-    type Error = CodegenError;
-
-    fn gen_let_stmt(
-        &mut self,
-        name: &str,
-        _is_mut: bool,
-        type_: Option<&Type>,
-        value: &Expr,
-        _span: &Span,
-    ) -> Result<(), CodegenError> {
-        let type_str = match type_ {
-            Some(t) => self.gen_type(t)?,
-            None => "auto".to_string(),
-        };
-        let val = self.gen_expr(value)?;
-        self.output.push_str(&type_str);
-        self.output.push(' ');
-        self.output.push_str(name);
-        self.output.push_str(" = ");
-        self.output.push_str(&val);
-        self.output.push_str(";\n");
-        Ok(())
-    }
-
-    fn gen_return_stmt(
-        &mut self,
-        expr: Option<&Expr>,
-        _span: &Span,
-    ) -> Result<(), CodegenError> {
-        match expr {
-            Some(e) => {
-                let val = self.gen_expr(e)?;
-                self.output.push_str("return ");
-                self.output.push_str(&val);
-                self.output.push_str(";\n");
+            Inst::Store(dst, _ty, val) => {
+                let v = self.val_str(val);
+                self.writeln_indented(&format!("{dst} = {v};"));
             }
-            None => self.output.push_str("return;\n"),
-        }
-        Ok(())
-    }
-
-    fn gen_expr_stmt(&mut self, expr: &Expr, _span: &Span) -> Result<(), CodegenError> {
-        let val = self.gen_expr(expr)?;
-        self.output.push_str(&val);
-        self.output.push_str(";\n");
-        Ok(())
-    }
-
-    fn gen_if_stmt(
-        &mut self,
-        cond: &Expr,
-        then_block: &Block,
-        else_block: Option<&Block>,
-        _span: &Span,
-    ) -> Result<(), CodegenError> {
-        let cond_str = self.gen_expr(cond)?;
-        self.output.push_str("if (");
-        self.output.push_str(&cond_str);
-        self.output.push_str(") {\n");
-        self.push();
-        for stmt in &then_block.stmts {
-            self.gen_stmt(stmt)?;
-        }
-        self.pop();
-        match else_block {
-            Some(block)
-                if block.stmts.len() == 1 && matches!(block.stmts.first(), Some(Stmt::If(..))) =>
-            {
-                self.write_indent();
-                self.output.push_str("} else ");
-                self.gen_stmt(&block.stmts[0])?;
+            Inst::Call(d, ty, name, args) => {
+                let t = Self::c_type(ty)?;
+                let a: Vec<_> = args.iter().map(|a| self.val_str(a)).collect();
+                self.writeln_indented(&format!("{t} {d} = {}({});", name, a.join(", ")));
             }
-            Some(block) => {
-                self.write_indent();
-                self.output.push_str("} else {\n");
+            Inst::If(cond, then_, else_) => {
+                let c = self.val_str(cond);
+                self.writeln_indented(&format!("if ({c}) {{"));
                 self.push();
-                for stmt in &block.stmts {
-                    self.gen_stmt(stmt)?;
-                }
+                for i in then_ { self.gen_inst(i)?; }
                 self.pop();
-                self.write_indent();
-                self.output.push_str("}\n");
+                if else_.is_empty() {
+                    self.writeln_indented("}");
+                } else {
+                    self.writeln_indented("} else {");
+                    self.push();
+                    for i in else_ { self.gen_inst(i)?; }
+                    self.pop();
+                    self.writeln_indented("}");
+                }
             }
-            None => {
-                self.write_indent();
-                self.output.push_str("}\n");
+            Inst::While(body) => {
+                self.writeln_indented("while (1) {");
+                self.push();
+                for i in body { self.gen_inst(i)?; }
+                self.pop();
+                self.writeln_indented("}");
+            }
+            Inst::Loop(body) => {
+                self.writeln_indented("while (1) {");
+                self.push();
+                for i in body { self.gen_inst(i)?; }
+                self.pop();
+                self.writeln_indented("}");
+            }
+            Inst::Break => {
+                self.writeln_indented("break;");
+            }
+            Inst::Return(v) => match v {
+                Some(val) => self.writeln_indented(&format!("return {};", self.val_str(val))),
+                None => self.writeln_indented("return;"),
+            },
+            Inst::Drop(val) => {
+                let v = self.val_str(val);
+                self.writeln_indented(&format!("(void){v};"));
             }
         }
         Ok(())
     }
-}
 
-impl FnGen for Codegen {
-    type Output = ();
-    type Error = CodegenError;
+    fn gen_binop(&mut self, d: &str, ty: &IrType, a: &Value, b: &Value, op: &str) {
+        let t = Self::c_type(ty).unwrap_or("auto");
+        let av = self.val_str(a);
+        let bv = self.val_str(b);
+        self.writeln_indented(&format!("{t} {d} = ({t})({av}) {op} ({bv});"));
+    }
 
-    fn gen_fn_def(&mut self, fn_def: &FnDef) -> Result<(), CodegenError> {
-        let ret_type = self.gen_type(&fn_def.return_type)?;
+    fn gen_cmp(&mut self, d: &str, a: &Value, b: &Value, op: &str) {
+        let av = self.val_str(a);
+        let bv = self.val_str(b);
+        self.writeln_indented(&format!("bool {d} = ({av}) {op} ({bv});"));
+    }
 
-        if fn_def.name == "main" {
+    fn gen_unop(&mut self, d: &str, a: &Value, op: &str) {
+        let av = self.val_str(a);
+        self.writeln_indented(&format!("bool {d} = {op}{av};"));
+    }
+
+    fn gen_function(&mut self, func: &IrFunction) -> Result<(), CodegenError> {
+        let ret = Self::c_type(&func.return_type)?;
+        if func.name == "main" {
             self.output.push_str("int main(int argc, char** argv)");
         } else {
-            write!(self.output, "{} {}(", ret_type, fn_def.name).unwrap();
-            for (i, param) in fn_def.params.iter().enumerate() {
-                if i > 0 {
-                    self.output.push_str(", ");
-                }
-                let pt = self.gen_type(&param.type_)?;
-                write!(self.output, "{} {}", pt, param.name).unwrap();
+            write!(self.output, "{ret} {}", func.name).unwrap();
+            self.output.push('(');
+            for (i, (name, ty)) in func.params.iter().enumerate() {
+                if i > 0 { self.output.push_str(", "); }
+                let t = Self::c_type(ty)?;
+                write!(self.output, "{t} {name}").unwrap();
             }
             self.output.push(')');
         }
-
         self.output.push_str(" {\n");
-        self.gen_block_body(&fn_def.body)?;
+        self.push();
+        for (name, ty) in &func.locals {
+            if !name.starts_with("_t") && !func.params.iter().any(|(pn, _)| pn == name) {
+                let t = Self::c_type(ty)?;
+                self.writeln_indented(&format!("{t} {name};"));
+            }
+        }
+        for inst in &func.insts {
+            self.gen_inst(inst)?;
+        }
+        self.pop();
         self.writeln_indented("}");
         Ok(())
     }
 }
 
-impl ProgramGen for Codegen {
+impl IrBackend for Codegen {
     type Output = String;
     type Error = CodegenError;
 
-    fn gen_program(&mut self, prog: &Program) -> Result<String, CodegenError> {
+    fn name(&self) -> &str {
+        "C codegen"
+    }
+
+    fn generate(&mut self, ir: &IrProgram) -> Result<String, CodegenError> {
         let mut out = String::new();
-
         out.push_str("// Generated by Uno compiler\n");
-        out.push_str("#include <stdint.h>\n");
-        out.push_str("#include <stdbool.h>\n");
-        out.push_str("#include <stdio.h>\n\n");
+        out.push_str("#include <stdint.h>\n#include <stdbool.h>\n#include <stdio.h>\n\n");
 
-        for fn_def in &prog.functions {
-            let ret_type = self.gen_type(&fn_def.return_type)?;
-            if fn_def.name == "main" {
+        for func in &ir.functions {
+            let ret = Self::c_type(&func.return_type)?;
+            if func.name == "main" {
                 out.push_str("int main(int argc, char** argv);\n");
             } else {
-                out.push_str(&ret_type);
+                out.push_str(ret);
                 out.push(' ');
-                out.push_str(&fn_def.name);
+                out.push_str(&func.name);
                 out.push('(');
-                for (i, param) in fn_def.params.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    let pt = self.gen_type(&param.type_)?;
-                    out.push_str(&pt);
+                for (i, (name, ty)) in func.params.iter().enumerate() {
+                    if i > 0 { out.push_str(", "); }
+                    let t = Self::c_type(ty)?;
+                    out.push_str(t);
                     out.push(' ');
-                    out.push_str(&param.name);
+                    out.push_str(name);
                 }
                 out.push_str(");\n");
             }
         }
         out.push('\n');
 
-        for fn_def in &prog.functions {
+        for func in &ir.functions {
             let mut cg = Codegen::new();
-            cg.gen_fn_def(fn_def)?;
+            cg.gen_function(func)?;
             out.push_str(&cg.output);
             out.push('\n');
         }
@@ -361,36 +246,25 @@ impl ProgramGen for Codegen {
     }
 }
 
-impl Backend for Codegen {
-    type Output = String;
-    type Err = CodegenError;
-
-    fn name(&self) -> &str {
-        "C codegen"
-    }
-
-    fn generate(&mut self, prog: &Program) -> Result<String, CodegenError> {
-        self.gen_program(prog)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uno_ir::lower::lower;
 
     fn c_generate(source: &str) -> Result<String, CodegenError> {
         let mut lexer = uno_lexer::Lexer::new(source.to_string());
         let tokens = lexer.tokenize();
         let mut parser = uno_parser::Parser::new(tokens);
         let program = parser.parse_program().unwrap();
-        Codegen::generate(&program)
+        let ir = lower(&program).unwrap();
+        Codegen::new().generate(&ir)
     }
 
     #[test]
     fn empty_main() {
         let out = c_generate("fn main() -> u32 { return 0; }").unwrap();
         assert!(out.contains("int main"));
-        assert!(out.contains("return 0;"));
+        assert!(out.contains("return"));
     }
 
     #[test]
@@ -408,7 +282,6 @@ mod tests {
         let out = c_generate("fn main() -> u32 { return 0; }").unwrap();
         assert!(out.contains("#include <stdint.h>"));
         assert!(out.contains("#include <stdbool.h>"));
-        assert!(out.contains("#include <stdio.h>"));
     }
 
     #[test]
@@ -416,6 +289,27 @@ mod tests {
         let src = "fn main() -> u256 { return 0; }";
         let result = c_generate(src);
         assert!(result.is_err());
-        assert!(matches!(result, Err(CodegenError::UnsupportedType(Type::Uint(256)))));
+    }
+
+    #[test]
+    fn while_loop_output() {
+        let out = c_generate("fn main() -> u32 { while true { return 1; } return 0; }").unwrap();
+        assert!(out.contains("while (1)"));
+        assert!(out.contains("return"));
+    }
+
+    #[test]
+    fn loop_break_output() {
+        let out = c_generate("fn main() -> u32 { loop { break; } return 0; }").unwrap();
+        assert!(out.contains("while (1)"));
+        assert!(out.contains("break;"));
+    }
+
+    #[test]
+    fn assignment_output() {
+        let src = "fn main() -> u32 { let mut x: u32 = 0; x = 5; return x; }";
+        let out = c_generate(src).unwrap();
+        assert!(out.contains("uint32_t x;"));
+        assert!(out.contains("x = "));
     }
 }

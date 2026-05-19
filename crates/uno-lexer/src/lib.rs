@@ -131,6 +131,7 @@ impl Lexer {
             "pub" => TokenKind::Pub,
             "while" => TokenKind::While,
             "loop" => TokenKind::Loop,
+            "break" => TokenKind::Break,
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "match" => TokenKind::Match,

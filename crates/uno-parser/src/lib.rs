@@ -83,6 +83,12 @@ impl Parser {
             return Err(ParseError::new(format!("lex error: {msg}"), t.span));
         }
         let start_span = self.token().span;
+        let public = if self.check(&TokenKind::Pub) {
+            self.advance();
+            true
+        } else {
+            false
+        };
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
@@ -116,6 +122,7 @@ impl Parser {
             return_type,
             body,
             span,
+            public,
         })
     }
 
@@ -145,6 +152,16 @@ impl Parser {
             TokenKind::Let => self.parse_let_stmt(),
             TokenKind::Return => self.parse_return_stmt(),
             TokenKind::If => self.parse_if_stmt(),
+            TokenKind::While => self.parse_while_stmt(),
+            TokenKind::Loop => self.parse_loop_stmt(),
+            TokenKind::Break => self.parse_break_stmt(),
+            TokenKind::Ident(_) => {
+                if self.tokens.get(self.pos + 1).map(|t| t.kind == TokenKind::Equals).unwrap_or(false) {
+                    self.parse_assign_stmt()
+                } else {
+                    self.parse_expr_stmt()
+                }
+            }
             _ => self.parse_expr_stmt(),
         }
     }
@@ -152,6 +169,12 @@ impl Parser {
     fn parse_let_stmt(&mut self) -> Result<Stmt, ParseError> {
         let start = self.token().span;
         self.expect(&TokenKind::Let)?;
+        let is_mut = if self.check(&TokenKind::Mut) {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let name = self.expect_ident()?;
         let type_ = if self.check(&TokenKind::Colon) {
             self.advance();
@@ -164,7 +187,7 @@ impl Parser {
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt::Let(
             name,
-            false,
+            is_mut,
             type_,
             value,
             Span::merge(start, self.tokens[self.pos.saturating_sub(1)].span),
@@ -210,6 +233,39 @@ impl Parser {
             None => then_block.span,
         };
         Ok(Stmt::If(cond, then_block, else_block, Span::merge(start, end)))
+    }
+
+    fn parse_while_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.token().span;
+        self.expect(&TokenKind::While)?;
+        let cond = self.parse_expr()?;
+        let body = self.parse_block()?;
+        let body_span = body.span;
+        Ok(Stmt::While(cond, body, Span::merge(start, body_span)))
+    }
+
+    fn parse_loop_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.token().span;
+        self.expect(&TokenKind::Loop)?;
+        let body = self.parse_block()?;
+        let body_span = body.span;
+        Ok(Stmt::Loop(body, Span::merge(start, body_span)))
+    }
+
+    fn parse_assign_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.token().span;
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Equals)?;
+        let value = self.parse_expr()?;
+        let semi = self.expect(&TokenKind::Semicolon)?;
+        Ok(Stmt::Assign(name, value, Span::merge(start, semi.span)))
+    }
+
+    fn parse_break_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.token().span;
+        self.expect(&TokenKind::Break)?;
+        let semi = self.expect(&TokenKind::Semicolon)?;
+        Ok(Stmt::Break(Span::merge(start, semi.span)))
     }
 
     fn parse_expr_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -537,6 +593,55 @@ mod tests {
             _ => panic!("expected block expr"),
         }
     }
+
+    #[test]
+    fn parse_while() {
+        let prog = parse("fn main() -> u32 { while true { return 1; } return 0; }").unwrap();
+        let body = &prog.functions[0].body;
+        assert!(matches!(&body.stmts[0], Stmt::While(..)));
+    }
+
+    #[test]
+    fn parse_loop() {
+        let prog = parse("fn main() -> u32 { loop { break; } }").unwrap();
+        let body = &prog.functions[0].body;
+        assert!(matches!(&body.stmts[0], Stmt::Loop(..)));
+    }
+
+    #[test]
+    fn parse_break() {
+        let prog = parse("fn main() -> u32 { loop { break; } }").unwrap();
+        let body = &prog.functions[0].body;
+        if let Stmt::Loop(block, _) = &body.stmts[0] {
+            assert!(matches!(&block.stmts[0], Stmt::Break(..)));
+        } else {
+            panic!("expected loop");
+        }
+    }
+
+    #[test]
+    fn parse_let_mut() {
+        let prog = parse("fn main() -> u32 { let mut x: u32 = 0; return x; }").unwrap();
+        let body = &prog.functions[0].body;
+        if let Stmt::Let(_, is_mut, _, _, _) = &body.stmts[0] {
+            assert!(*is_mut);
+        } else {
+            panic!("expected let stmt");
+        }
+    }
+
+    #[test]
+    fn parse_pub_fn() {
+        let prog = parse("pub fn foo() -> u32 { return 1; }").unwrap();
+        assert!(prog.functions[0].public);
+    }
+
+    #[test]
+    fn parse_assignment() {
+        let prog = parse("fn main() -> u32 { let mut x: u32 = 0; x = 5; return x; }").unwrap();
+        let body = &prog.functions[0].body;
+        assert!(matches!(&body.stmts[1], Stmt::Assign(..)));
+    }
 }
 
 fn expr_span(expr: &Expr) -> Span {
@@ -554,8 +659,12 @@ fn expr_span(expr: &Expr) -> Span {
 fn expr_span_for_stmt(stmt: &Stmt) -> Span {
     match stmt {
         Stmt::Let(_, _, _, _, s)
+        | Stmt::Assign(_, _, s)
         | Stmt::Return(_, s)
         | Stmt::Expr(_, s)
-        | Stmt::If(_, _, _, s) => *s,
+        | Stmt::If(_, _, _, s)
+        | Stmt::While(_, _, s)
+        | Stmt::Loop(_, s)
+        | Stmt::Break(s) => *s,
     }
 }
