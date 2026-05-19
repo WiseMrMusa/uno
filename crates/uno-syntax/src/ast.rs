@@ -77,5 +77,6 @@ pub struct FnDef {
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub imports: Vec<String>,
     pub functions: Vec<FnDef>,
 }

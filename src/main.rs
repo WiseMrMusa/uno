@@ -1,12 +1,16 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 use uno_codegen::c::Codegen;
 use uno_codegen::wasm::WasmCodegen;
 use uno_codegen::CodegenError;
 use uno_ir::lower::lower;
 use uno_ir::IrBackend;
+use uno_syntax::diagnostic::DiagnosticBag;
 use uno_syntax::source_file::SourceFile;
 
 #[derive(Parser)]
@@ -57,6 +61,12 @@ struct Package {
     name: String,
 }
 
+struct ProjectContext {
+    name: String,
+    sources: HashMap<PathBuf, SourceFile>,
+    visited: HashSet<PathBuf>,
+}
+
 fn main() {
     let cli = Cli::parse();
     let res = match cli.cmd {
@@ -67,7 +77,13 @@ fn main() {
         Subcmd::Clean => cmd_clean(cli.verbose),
     };
     if let Err(e) = res {
-        eprintln!("error: {e}");
+        let color_err = std::io::stderr().is_terminal();
+        let (red, bold, reset) = if color_err {
+            ("\x1b[1;31m", "\x1b[1m", "\x1b[0m")
+        } else {
+            ("", "", "")
+        };
+        eprintln!("{red}{bold}error:{reset} {e}");
         std::process::exit(1);
     }
 }
@@ -96,35 +112,127 @@ edition = "2024"
     Ok(())
 }
 
-fn read_project() -> Result<(String, SourceFile, uno_parser::Parser), Box<dyn std::error::Error>> {
+fn read_project(verbose: bool) -> Result<ProjectContext, Box<dyn std::error::Error>> {
     let manifest_str = fs::read_to_string("uno.toml")
         .map_err(|_| "uno.toml not found (are you in an Uno project?)")?;
     let manifest: Manifest = toml::from_str(&manifest_str)?;
     let project_name = manifest.package.name;
 
-    let source_str = fs::read_to_string("src/main.uno")
-        .map_err(|_| "src/main.uno not found")?;
-    let source = SourceFile::new(source_str.clone());
+    let src_dir = PathBuf::from("src");
+    let main_path = src_dir.join("main.uno");
+
+    let mut ctx = ProjectContext {
+        name: project_name,
+        sources: HashMap::new(),
+        visited: HashSet::new(),
+    };
+
+    if verbose { eprintln!("reading sources..."); }
+    collect_sources(&src_dir, &main_path, &mut ctx, verbose)?;
+
+    Ok(ctx)
+}
+
+fn collect_sources(
+    src_dir: &Path,
+    current_path: &Path,
+    ctx: &mut ProjectContext,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let canon = current_path.canonicalize().unwrap_or_else(|_| current_path.to_path_buf());
+    if ctx.visited.contains(&canon) {
+        return Ok(());
+    }
+    ctx.visited.insert(canon.clone());
+
+    if verbose { eprintln!("  reading {}", current_path.display()); }
+
+    let source_str = fs::read_to_string(current_path)
+        .map_err(|_| format!("{} not found", current_path.display()))?;
+    let sf = SourceFile::with_path(source_str.clone(), current_path.display().to_string());
+    ctx.sources.insert(current_path.to_path_buf(), sf);
 
     let mut lexer = uno_lexer::Lexer::new(source_str);
     let tokens = lexer.tokenize();
+    let mut parser = uno_parser::Parser::new(tokens);
+    let program = parser.parse_program()
+        .map_err(|e| {
+            let sf = ctx.sources.get(current_path).unwrap();
+            sf.format_parse_error(&e)
+        })?;
 
-    let parser = uno_parser::Parser::new(tokens);
-    Ok((project_name, source, parser))
+    for import in &program.imports {
+        let path = src_dir.join(format!("{import}.uno"));
+        if !path.exists() {
+            let sf = ctx.sources.get(current_path).unwrap();
+            eprintln!(
+                "{}",
+                sf.format_error(uno_syntax::span::Span::empty(), &format!("import '{import}.uno' not found"))
+            );
+            continue;
+        }
+        collect_sources(src_dir, &path, ctx, verbose)?;
+    }
+
+    Ok(())
 }
 
-fn parse_and_lower(
-    source: &SourceFile,
-    parser: &mut uno_parser::Parser,
+fn parse_all(
+    ctx: &mut ProjectContext,
     verbose: bool,
 ) -> Result<uno_ir::IrProgram, Box<dyn std::error::Error>> {
+    let mut all_bag = DiagnosticBag::new();
+    let mut all_functions = Vec::new();
+
     if verbose { eprintln!("parsing..."); }
-    let program = parser.parse_program().map_err(|e| {
-        format!("{}", source.format_error(e.span, &e.message))
-    })?;
+    let entry_order: Vec<PathBuf> = ctx.sources.keys().cloned().collect();
+    for path in &entry_order {
+        if verbose { eprintln!("  parsing {}", path.display()); }
+        let source_str = fs::read_to_string(path)
+            .map_err(|_| format!("cannot read {}", path.display()))?;
+
+        let mut lexer = uno_lexer::Lexer::new(source_str);
+        let tokens = lexer.tokenize();
+        let mut parser = uno_parser::Parser::new(tokens);
+        let (program, mut diags) = parser.parse_program_check();
+        all_bag.merge(&mut diags);
+        all_functions.extend(program.functions);
+    }
+
+    if all_bag.has_errors() {
+        let sf = SourceFile::new(String::new());
+        eprint!("{}", sf.format_diagnostics(&all_bag));
+        return Err("compilation failed due to errors".into());
+    }
+
+    let merged = uno_syntax::ast::Program {
+        imports: Vec::new(),
+        functions: all_functions,
+    };
+
+    if verbose { eprintln!("including standard library..."); }
+    let merged = inject_stdlib(merged);
 
     if verbose { eprintln!("lowering to IR..."); }
-    lower(&program).map_err(|e| format!("lowering error: {e}").into())
+    lower(&merged).map_err(|e| format!("lowering error: {e}").into())
+}
+
+fn inject_stdlib(program: uno_syntax::ast::Program) -> uno_syntax::ast::Program {
+    let mut prog = program;
+
+    let print_source = r#"
+fn __print_u32(val: u32) -> u32 { return val; }
+fn __print_bool(val: bool) -> u32 { return 0; }
+"#;
+
+    let mut lexer = uno_lexer::Lexer::new(print_source.to_string());
+    let tokens = lexer.tokenize();
+    let mut parser = uno_parser::Parser::new(tokens);
+    if let Ok(mut std_prog) = parser.parse_program() {
+        prog.functions.append(&mut std_prog.functions);
+    }
+
+    prog
 }
 
 fn get_backend(target: &Target) -> Box<dyn IrBackend<Output = String, Error = CodegenError>> {
@@ -134,17 +242,74 @@ fn get_backend(target: &Target) -> Box<dyn IrBackend<Output = String, Error = Co
     }
 }
 
+struct CacheEntry {
+    hash: u64,
+    output: String,
+}
+
+fn file_hash(path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
+    let meta = fs::metadata(path)?;
+    let modified = meta.modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let len = meta.len();
+    Ok(modified.wrapping_mul(31).wrapping_add(len))
+}
+
 fn cmd_build(
     run_after: bool,
     target: &Target,
     out_dir: &str,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (project_name, source, mut parser) = read_project()?;
-    let ir = parse_and_lower(&source, &mut parser, verbose)?;
-
     let target_dir = PathBuf::from(out_dir);
     fs::create_dir_all(&target_dir)?;
+
+    let cache_path = target_dir.join(".uno_cache.toml");
+    let mut cache: HashMap<String, CacheEntry> = if cache_path.exists() {
+        let _data = fs::read_to_string(&cache_path)?;
+        HashMap::new()
+    } else {
+        HashMap::new()
+    };
+
+    let mut ctx = read_project(verbose)?;
+
+    let mut hash_combined: u64 = 0;
+    for path in ctx.sources.keys() {
+        hash_combined = hash_combined.wrapping_add(file_hash(path)?);
+    }
+
+    let cache_key = format!("{:?}_{}", target, hash_combined);
+    if let Some(_entry) = cache.get(&cache_key) {
+        let output_path = match target {
+            Target::C => {
+                let bin = if cfg!(target_os = "windows") {
+                    format!("{}.exe", ctx.name)
+                } else {
+                    ctx.name.clone()
+                };
+                target_dir.join(&bin)
+            }
+            Target::Wasm => target_dir.join(format!("{}.wasm", ctx.name)),
+        };
+        if output_path.exists() {
+            if verbose { eprintln!("cache hit — skipping compilation"); }
+            if run_after {
+                if let Target::C = target {
+                    let status = Command::new(&output_path).status()
+                        .map_err(|_| "failed to run binary")?;
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            }
+            println!("{} (cached)", ctx.name);
+            return Ok(());
+        }
+    }
+
+    let ir = parse_all(&mut ctx, verbose)?;
 
     if verbose { eprintln!("generating code for target {target:?}..."); }
 
@@ -155,18 +320,21 @@ fn cmd_build(
     match target {
         Target::C => {
             let c_path = target_dir.join("output.c");
-            fs::write(&c_path, &code)?;
+
+            let code_with_lines = add_line_directives(&code, "src/main.uno");
+            fs::write(&c_path, &code_with_lines)?;
 
             if verbose { eprintln!("compiling with cc..."); }
             let binary_name = if cfg!(target_os = "windows") {
-                format!("{project_name}.exe")
+                format!("{}.exe", ctx.name)
             } else {
-                project_name.clone()
+                ctx.name.clone()
             };
             let binary_path = target_dir.join(&binary_name);
 
             let status = Command::new("cc")
                 .arg("-std=c23")
+                .arg("-g")
                 .arg("-o")
                 .arg(&binary_path)
                 .arg(&c_path)
@@ -177,7 +345,12 @@ fn cmd_build(
                 return Err("C compilation failed".into());
             }
 
-            println!("Compiled '{project_name}' ({backend_name})");
+            cache.insert(cache_key.clone(), CacheEntry {
+                hash: hash_combined,
+                output: c_path.display().to_string(),
+            });
+
+            println!("Compiled '{}' ({backend_name})", ctx.name);
 
             if run_after {
                 if verbose { eprintln!("running {}...", binary_path.display()); }
@@ -192,7 +365,7 @@ fn cmd_build(
             fs::write(&wat_path, &code)?;
 
             if verbose { eprintln!("compiling with wat2wasm..."); }
-            let wasm_path = target_dir.join(format!("{project_name}.wasm"));
+            let wasm_path = target_dir.join(format!("{}.wasm", ctx.name));
 
             let wat2wasm = Command::new("npx")
                 .args(["--yes", "wat2wasm"])
@@ -210,7 +383,11 @@ fn cmd_build(
 
             match wat2wasm {
                 Ok(status) if status.success() => {
-                    println!("Compiled '{project_name}' to WASM ({backend_name})");
+                    cache.insert(cache_key.clone(), CacheEntry {
+                        hash: hash_combined,
+                        output: wasm_path.display().to_string(),
+                    });
+                    println!("Compiled '{}' to WASM ({backend_name})", ctx.name);
                     if run_after {
                         run_wasm(&target_dir, &wasm_path, verbose)?;
                     }
@@ -223,7 +400,19 @@ fn cmd_build(
         }
     }
 
+    let cache_data = format!("# incremental cache\n");
+    fs::write(&cache_path, cache_data)?;
+
     Ok(())
+}
+
+fn add_line_directives(code: &str, source_file: &str) -> String {
+    let mut out = String::new();
+    out.push_str("# 1 \"");
+    out.push_str(source_file);
+    out.push_str("\" 1\n");
+    out.push_str(code);
+    out
 }
 
 fn run_wasm(
@@ -273,13 +462,11 @@ if (typeof result === "bigint") {{
 }
 
 fn cmd_check(out_dir: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (_project_name, source, mut parser) = read_project()?;
-    if verbose { eprintln!("parsing..."); }
-    let program = parser.parse_program().map_err(|e| {
-        format!("{}", source.format_error(e.span, &e.message))
-    })?;
-    if verbose { eprintln!("lowering to IR..."); }
-    lower(&program).map_err(|e| format!("lowering error: {e}"))?;
+    let mut ctx = read_project(verbose)?;
+    let ir = parse_all(&mut ctx, verbose)?;
+    if verbose {
+        eprintln!("IR: {} functions", ir.functions.len());
+    }
     println!("check: no errors found");
     let _ = out_dir;
     Ok(())

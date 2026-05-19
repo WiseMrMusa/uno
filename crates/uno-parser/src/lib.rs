@@ -1,5 +1,6 @@
 
 use uno_syntax::ast::{BinOp, Block, Expr, FnDef, Param, Program, Stmt, Type, UnOp};
+use uno_syntax::diagnostic::{DiagnosticBag, ErrorCode};
 use uno_syntax::error::ParseError;
 use uno_syntax::span::Span;
 use uno_syntax::token::{Token, TokenKind};
@@ -7,16 +8,29 @@ use uno_syntax::token::{Token, TokenKind};
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    pub diagnostics: DiagnosticBag,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            diagnostics: DiagnosticBag::new(),
+        }
     }
 
     fn kind(&self) -> TokenKind {
         self.tokens
             .get(self.pos)
+            .map(|t| t.kind.clone())
+            .unwrap_or(TokenKind::Eof)
+    }
+
+    #[allow(dead_code)]
+    fn kind_at(&self, offset: usize) -> TokenKind {
+        self.tokens
+            .get(self.pos + offset)
             .map(|t| t.kind.clone())
             .unwrap_or(TokenKind::Eof)
     }
@@ -42,10 +56,57 @@ impl Parser {
         if self.check(kind) {
             Ok(self.advance())
         } else {
-            Err(ParseError::new(
+            let err = ParseError::new(
                 format!("expected {:?}, found {:?}", kind, self.kind()),
                 self.token().span,
-            ))
+            );
+            Err(err)
+        }
+    }
+
+    fn expect_or_recover(&mut self, kind: &TokenKind) -> Result<Token, ()> {
+        if self.check(kind) {
+            Ok(self.advance())
+        } else {
+            let err = ParseError::with_hint(
+                ParseError::with_code(
+                    ErrorCode::E001,
+                    format!("expected {:?}, found {:?}", kind, self.kind()),
+                    self.token().span,
+                ),
+                format!("try inserting {:?}", kind),
+            );
+            self.diagnostics.merge(&mut DiagnosticBag::from(err));
+            Err(())
+        }
+    }
+
+    fn sync_to_stmt_boundary(&mut self) {
+        while !matches!(
+            self.kind(),
+            TokenKind::Fn
+                | TokenKind::Let
+                | TokenKind::Return
+                | TokenKind::If
+                | TokenKind::While
+                | TokenKind::Loop
+                | TokenKind::Break
+                | TokenKind::RBrace
+                | TokenKind::Eof
+        ) {
+            self.advance();
+        }
+    }
+
+    fn sync_to_fn_or_eof(&mut self) {
+        while !matches!(self.kind(), TokenKind::Fn | TokenKind::Use | TokenKind::Eof) {
+            self.advance();
+        }
+    }
+
+    fn skip_until(&mut self, kinds: &[TokenKind]) {
+        while !kinds.contains(&self.kind()) && !matches!(self.kind(), TokenKind::Eof) {
+            self.advance();
         }
     }
 
@@ -66,22 +127,86 @@ impl Parser {
     }
 
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let mut imports = Vec::new();
         let mut functions = Vec::new();
         while !self.check(&TokenKind::Eof) {
             if let TokenKind::Error(msg) = self.kind() {
                 let t = self.advance();
-                return Err(ParseError::new(format!("lex error: {msg}"), t.span));
+                self.diagnostics.error(ErrorCode::E005, format!("lex error: {msg}"), t.span);
+                self.sync_to_fn_or_eof();
+                continue;
             }
-            functions.push(self.parse_fn_def()?);
+            if self.check(&TokenKind::Use) {
+                match self.parse_use() {
+                    Ok(path) => imports.push(path),
+                    Err(_) => { self.sync_to_fn_or_eof(); }
+                }
+                continue;
+            }
+            match self.parse_fn_def() {
+                Ok(f) => functions.push(f),
+                Err(_e) => {
+                    self.sync_to_fn_or_eof();
+                }
+            }
         }
-        Ok(Program { functions })
+        if self.diagnostics.has_errors() {
+            return Err(ParseError::new(
+                format!("{} parse error(s) found", self.diagnostics.error_count()),
+                Span::empty(),
+            ));
+        }
+        Ok(Program { imports, functions })
+    }
+
+    pub fn parse_program_check(&mut self) -> (Program, DiagnosticBag) {
+        let mut imports = Vec::new();
+        let mut functions = Vec::new();
+        while !self.check(&TokenKind::Eof) {
+            if let TokenKind::Error(msg) = self.kind() {
+                let t = self.advance();
+                self.diagnostics.error(ErrorCode::E005, format!("lex error: {msg}"), t.span);
+                self.sync_to_fn_or_eof();
+                continue;
+            }
+            if self.check(&TokenKind::Use) {
+                match self.parse_use() {
+                    Ok(path) => imports.push(path),
+                    Err(_) => { self.sync_to_fn_or_eof(); }
+                }
+                continue;
+            }
+            match self.parse_fn_def() {
+                Ok(f) => functions.push(f),
+                Err(_e) => {
+                    self.sync_to_fn_or_eof();
+                }
+            }
+        }
+        let diags = std::mem::take(&mut self.diagnostics);
+        (Program { imports, functions }, diags)
+    }
+
+    pub fn take_diagnostics(&mut self) -> DiagnosticBag {
+        std::mem::take(&mut self.diagnostics)
     }
 
     fn parse_fn_def(&mut self) -> Result<FnDef, ParseError> {
         if let TokenKind::Error(msg) = self.kind() {
             let t = self.advance();
+            self.diagnostics.error(ErrorCode::E005, format!("lex error: {msg}"), t.span);
             return Err(ParseError::new(format!("lex error: {msg}"), t.span));
         }
+
+        let result = self.try_parse_fn_def();
+        if let Err(ref e) = result {
+            self.diagnostics.error(e.code, e.message.clone(), e.span);
+            self.sync_to_fn_or_eof();
+        }
+        result
+    }
+
+    fn try_parse_fn_def(&mut self) -> Result<FnDef, ParseError> {
         let start_span = self.token().span;
         let public = if self.check(&TokenKind::Pub) {
             self.advance();
@@ -124,6 +249,13 @@ impl Parser {
             span,
             public,
         })
+    }
+
+    fn parse_use(&mut self) -> Result<String, ParseError> {
+        self.expect(&TokenKind::Use)?;
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Semicolon)?;
+        Ok(name)
     }
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
@@ -641,6 +773,14 @@ mod tests {
         let prog = parse("fn main() -> u32 { let mut x: u32 = 0; x = 5; return x; }").unwrap();
         let body = &prog.functions[0].body;
         assert!(matches!(&body.stmts[1], Stmt::Assign(..)));
+    }
+
+    #[test]
+    fn parse_use_import() {
+        let prog = parse("use math; fn main() -> u32 { return 0; }").unwrap();
+        assert_eq!(prog.imports.len(), 1);
+        assert_eq!(prog.imports[0], "math");
+        assert_eq!(prog.functions.len(), 1);
     }
 }
 
